@@ -72,6 +72,36 @@ ranking vector from `stat`, named by the Ensembl ID in `feature`, with missing
 values dropped. Get the human Hallmark sets with msigdbr, using Ensembl IDs.
 Run `fgsea(sets, stat, minSize = 15, maxSize = 500)` and sort by `padj`.*
 
+```{r}
+# 1. Rank all genes by the DESeq2 statistic: the whole ordered list is the
+#    input to fgsea, not just the significant genes.
+rank_vec <- genes_by_outcome$stat
+names(rank_vec) <- genes_by_outcome$feature   # Ensembl IDs as the names
+rank_vec <- sort(rank_vec[!is.na(rank_vec)], decreasing = TRUE)
+
+# 2. Hallmark gene sets, keyed by Ensembl ID so they match our feature names.
+#    split() makes one list entry per set name, holding its member IDs.
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") |>
+  split(ensembl_gene, gs_name)
+
+# 3. Check the identifiers matched BEFORE trusting any result: how many of
+#    our genes can be found in at least one set?
+cat("genes in ranking:", length(rank_vec), "\n")
+cat("in >=1 Hallmark set:", sum(names(rank_vec) %in% unlist(hallmark)), "\n")
+cat("version suffixes in our IDs:", sum(grepl("\\.", names(rank_vec))), "(want 0)\n")
+
+# 4. Run fgsea and sort by adjusted p-value.
+set.seed(1)
+fg_outcome <- fgsea(pathways = hallmark, stats = rank_vec,
+                    minSize = 15, maxSize = 500) |>
+  as_tibble() |>
+  arrange(padj)
+
+fg_outcome |>
+  select(pathway, size, NES, padj) |>
+  slice_head(n = 12)
+```
+
 - Genes in the ranking, and how many of them appear in at least one set?
   - *Your answer:*
 - Sets significant, and how many point each way (26, with 23 higher in preterm)?

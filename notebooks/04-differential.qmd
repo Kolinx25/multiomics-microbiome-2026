@@ -38,7 +38,8 @@ metadata <- d$metadata |> left_join(sample_groups, by = "sample_id")
 ```
 
 ```{r}
-count(metadata, time_point, community)
+# dplyr:: explicitly, because DESeq2's matrixStats package masks bare count().
+dplyr::count(metadata, time_point, community)
 ```
 
 # Exercise 1: Test the gene table with a grouping from the species table
@@ -71,6 +72,39 @@ columns `feature` (the Ensembl ID), `baseMean`, `log2FoldChange`, `lfcSE`,
 
 Tomorrow's notebook reads that file.
 
+```{r}
+# Week 18 samples only, and the count matrix columns in the same order.
+week18 <- metadata$sample_id[metadata$time_point == "week_18"]
+counts_w18 <- d$genes[, week18]
+meta_w18 <- metadata[match(week18, metadata$sample_id), ]
+
+# Safety check: count matrix columns must match the sample table rows, in order.
+stopifnot(identical(colnames(counts_w18), meta_w18$sample_id))
+
+# Keep genes with a count of at least 10 in at least a quarter of the samples.
+keep <- rowSums(counts_w18 >= 10) >= ncol(counts_w18) / 4
+
+# DESeq2 runs on the raw counts and does its own normalisation.
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_w18[keep, ],
+  colData = meta_w18,
+  design = ~ community
+)
+dds <- DESeq(dds)
+
+# The contrast: anaerobe against lactobacillus means positive log2FoldChange
+# = higher in anaerobe-dominant samples.
+res <- results(dds, contrast = c("community", "anaerobe", "lactobacillus"))
+res_df <- as.data.frame(res) |>
+  rownames_to_column("feature") |>
+  left_join(d$gene_info, by = c("feature" = "ensembl_gene_id")) |>
+  select(feature, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, symbol, gene_name)
+
+write_csv(res_df, here("data/genes_by_community.csv"))
+cat("Samples:", ncol(counts_w18),
+    " Genes tested:", sum(!is.na(res_df$pvalue)), "\n")
+```
+
 - Samples in each group (37 and 120)? Genes tested (13,738)?
   - *Your answer:*
 - Do the first five count-table columns match the first five `sample_id` values, in order?
@@ -83,6 +117,29 @@ Suggested request: *Write a summary of the results: how many genes have
 more than two-fold, and how many go each way. Then list the top 20 genes by
 `padj` with symbol, name and fold change.*
 
+```{r}
+# Plain sums instead of count() here: DESeq2's packages mask dplyr's names.
+# "More than two-fold" means |log2FoldChange| > 1, i.e. at least 2x up or down.
+res_df |>
+  summarise(
+    pvalue_lt_0.05 = sum(pvalue < 0.05, na.rm = TRUE),
+    padj_lt_0.05 = sum(padj < 0.05, na.rm = TRUE),
+    more_than_2fold = sum(padj < 0.05 & abs(log2FoldChange) > 1, na.rm = TRUE)
+  )
+
+res_df |>
+  filter(padj < 0.05, abs(log2FoldChange) > 1) |>
+  summarise(
+    higher_in_anaerobe = sum(log2FoldChange > 0),
+    higher_in_lactobacillus = sum(log2FoldChange < 0)
+  )
+
+res_df |>
+  arrange(padj) |>
+  head(20) |>
+  select(symbol, gene_name, log2FoldChange, padj)
+```
+
 - Do you get 1,815 at `padj` below 0.05 and 303 of those more than two-fold?
   - *Your answer:*
 - What do the top 20 genes have in common?
@@ -93,6 +150,59 @@ more than two-fold, and how many go each way. Then list the top 20 genes by
 From here on, write your own requests. Volcano plot, MA plot, raw p-value
 histogram with the no-difference line, boxplots of the top six genes by
 community.
+
+```{r}
+com_col <- c("anaerobe" = "#B2182B", "lactobacillus" = "#2166AC")
+sig_line <- sum(!is.na(res_df$pvalue)) / 10  # flat line under the null
+
+# 1. Volcano: fold change against significance. Dashed lines are the cutoffs
+#    (padj 0.05 vertically; two-fold change at x = -1 and +1).
+#    Sign convention: positive log2FoldChange = higher in the FIRST group in
+#    the contrast, i.e. anaerobe. Negative = higher in lactobacillus.
+volcano <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(colour = padj < 0.05), alpha = 0.4, size = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  scale_colour_manual(values = c("grey70", "black"), name = "padj < 0.05") +
+  labs(x = "log2 fold change (positive = higher in anaerobe)",
+       y = "-log10(p-value)")
+volcano
+
+# 2. MA plot: every gene's fold change against its average expression.
+#    The funnel shape is normal: low-count genes get noisy, exaggerated
+#    fold changes; DESeq2 shrinks them toward zero.
+ma <- ggplot(res_df, aes(x = baseMean, y = log2FoldChange)) +
+  geom_point(aes(colour = padj < 0.05), alpha = 0.4, size = 0.6) +
+  scale_x_log10() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "mean expression (log scale)", y = "log2 fold change")
+ma
+
+# 3. Raw p-value histogram. If nothing were different, the bars would be flat
+#    at the dashed line (genes tested / 10). A spike near zero is real signal.
+phist <- ggplot(res_df, aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, colour = "white") +
+  geom_hline(yintercept = sig_line, linetype = "dashed") +
+  labs(x = "raw p-value", y = "number of genes")
+phist
+
+# 4. Boxplots of the top six genes by padj. Counts per million, then log2.
+#    This normalises for library size so the groups can be compared.
+top6 <- res_df |> arrange(padj) |> head(6) |> pull(feature)
+totals <- colSums(counts_w18)
+box_df <- t(t(counts_w18[top6, ]) / totals * 1e6) |>
+  as_tibble(rownames = "feature") |>
+  pivot_longer(-feature, names_to = "sample_id", values_to = "cpm") |>
+  mutate(log_cpm = log2(cpm + 1)) |>
+  left_join(select(meta_w18, sample_id, community), by = "sample_id") |>
+  left_join(select(res_df, feature, symbol), by = "feature")
+boxes <- ggplot(box_df, aes(x = community, y = log_cpm, fill = community)) +
+  geom_boxplot() +
+  facet_wrap(~ symbol) +
+  scale_fill_manual(values = com_col) +
+  labs(y = "log2(cpm + 1)")
+boxes
+```
 
 - Pi's explanation of the sign convention:
   - *Your answer:*

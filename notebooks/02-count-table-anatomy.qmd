@@ -56,6 +56,23 @@ Answer before running anything below.
 
 ## Part 2 — Ask, look, decide
 
+### Step 0: the answer to question 1
+
+How many of the 220 species appear in each sample? Count the species with at
+least one read in every sample, then summarise:
+
+```{r step0-species-detected}
+species_mat <- species |> select(-taxon) |> as.matrix()   # drop the name column; everything left is a sample
+
+detected_species <- apply(species_mat, 2, \(x) sum(x > 0))  # per sample: how many species present
+
+tibble(
+  median = median(detected_species),
+  smallest = min(detected_species),
+  largest = max(detected_species)
+)
+```
+
 ### Step 1: the per-sample numbers
 
 Suggested request: *In step 1 of my notebook, make one data frame with a row

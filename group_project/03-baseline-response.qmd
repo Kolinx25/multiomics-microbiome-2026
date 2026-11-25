@@ -1,0 +1,268 @@
+---
+title: "Study A: did the probiotic only work in people whose community started a certain way?"
+format:
+  html:
+    theme: minty
+    css: report.css
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+    code-tools: true
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+The trial in `02-community-shift.qmd` asked whether the community changed from
+pre to post and whether that change differed by arm, averaged over everyone.
+Averages can hide subgroups: the probiotic might have helped only the people
+whose vaginal community was *already* a certain way at the start, and diluted
+everyone else.
+
+This report asks a third question:
+
+3. **Does the effect of the probiotic depend on the community the participant
+   started with?**
+
+"Started a certain way" we define simply: at the pre visit, did Lactobacillus
+make up at least 10% of the microbiome (we call these **Lactobacillus-present**)
+or less (we call these **Lactobacillus-low**)? Lactobacillus is the genus a
+healthy vaginal community is usually built around, so it is the natural way to
+split the starting states.
+
+"Worked" we measure three ways, all per participant (post minus pre):
+
+- **Nugent score** fell (a clinical score of vaginal dysbiosis; lower is healthier)
+- **pH** fell (a healthy vaginal pH is low, roughly under 4.5)
+- **Amine test** flipped from Positive to Negative (a whiff-test sign of dysbiosis)
+
+One workshop rule shapes the whole design: **define a group from one table, test
+it on another.** We define the starting groups from the *microbiome* table, then
+test the response in the *clinical metadata* and the *gene* table. We never test
+the microbiome's own Lactobacillus change against a group defined by
+Lactobacillus — that would be circular (see the caution in section 5).
+
+## 2. Data
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(DESeq2)
+
+source(here("R/count_tables.R"))
+
+d <- read_counts("group_a")
+
+# Share of the community made up by Lactobacillus, per sample.
+lacto_rows <- grep("Lactobacillus", d$taxonomy$Genus)
+lacto_share <- colSums(prop.table(d$species, 2)[lacto_rows, , drop = FALSE])
+
+# One row per participant: baseline state + the pre-to-post changes.
+meta <- d$metadata |> mutate(lacto_share = lacto_share[sample_id])
+participants <- meta |>
+  filter(time_point == "pre") |>
+  select(participant_id, arm, pre_share = lacto_share,
+         pre_ph = ph, pre_nugent = nugent, pre_amine = amine_test) |>
+  left_join(meta |>
+              filter(time_point == "post") |>
+              select(participant_id, post_ph = ph, post_nugent = nugent,
+                     post_amine = amine_test),
+            by = "participant_id") |>
+  mutate(
+    start   = if_else(pre_share >= 0.10, "Lacto-present", "Lacto-low"),
+    chg_ph     = post_ph - pre_ph,
+    chg_nugent = post_nugent - pre_nugent,
+    amine_ok   = pre_amine == "Positive" & post_amine == "Negative"
+  )
+participants
+```
+
+```{r who}
+participants |> dplyr::count(arm, start) |>   # dplyr:: because DESeq2 masks count()
+  mutate(share = round(n / sum(n) * 100)) |>
+  mutate(share = round(n / sum(n) * 100)) |>
+  arrange(arm, start)
+```
+
+Most participants (131 of 176) started Lactobacillus-low; the community in this
+cohort is broadly dysbiotic at baseline. Every arm × start group has at least 15
+participants, so all four cells are worth looking at, though the Lacto-present
+cells are small.
+
+## 3. Where each participant started
+
+```{r baseline-plot, fig.width=7, fig.height=3}
+ggplot(participants, aes(pre_share)) +
+  geom_histogram(bins = 40, fill = "#2b7bb9", colour = "white") +
+  geom_vline(xintercept = 0.10, linetype = "dashed", colour = "#c46a3f") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Lactobacillus share of the community at the pre visit",
+       subtitle = "The dashed line is the 10% cut that defines the two starting groups",
+       x = "Lactobacillus share at pre", y = "Participants") +
+  theme_minimal()
+```
+
+The 10% cut is a choice, not a law of nature. The distribution is continuous
+with a long tail; about half the cohort sits under 3%. Section 6 records the
+alternatives we did not choose.
+
+## 4. Did the clinical outcomes move differently?
+
+For each outcome we fit a linear model of the form
+`change ~ arm * start`. The `arm:start` interaction term is the answer to our
+question: it asks whether the probiotic's effect (probiotic minus placebo) was
+itself different in the two starting groups. A small p-value would say yes,
+the effect depended on where the community started.
+
+```{r clinical}
+tests <- tribble(
+  ~outcome, ~formula,
+  "Nugent score change", "chg_nugent ~ arm * start",
+  "pH change",           "chg_ph ~ arm * start"
+)
+tests |>
+  mutate(p_interaction = map_dbl(formula, ~ summary(lm(.x, participants))$coefficients["armprobiotic:startLacto-present", "Pr(>|t|)"])) |>
+  mutate(p_interaction = signif(p_interaction, 2))
+```
+
+```{r clinical-means}
+participants |>
+  filter(!is.na(chg_nugent), !is.na(chg_ph)) |>
+  group_by(arm, start) |>
+  summarise(n = n(),
+            `mean Nugent change` = round(mean(chg_nugent), 1),
+            `mean pH change`     = round(mean(chg_ph), 2),
+            .groups = "drop")
+```
+
+```{r amine}
+participants |>
+  filter(pre_amine == "Positive") |>
+  group_by(arm, start) |>
+  summarise(n = n(),
+            `% amine Positive -> Negative` = round(mean(amine_ok) * 100),
+            .groups = "drop")
+```
+
+```{r clinical-plot, fig.width=9, fig.height=3.6}
+participants |>
+  filter(!is.na(chg_nugent)) |>
+  ggplot(aes(arm, chg_nugent, fill = arm)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_boxplot(outlier.size = 0.5, show.legend = FALSE) +
+  facet_wrap(~ start) +
+  scale_fill_manual(values = c(placebo = "#c46a3f", probiotic = "#2b7bb9")) +
+  labs(title = "Nugent score change from pre to post, by starting group",
+       subtitle = "Negative is improvement. The probiotic's edge looks bigger in the Lacto-low group, but the interaction test is not significant (p = 0.13)",
+       x = NULL, y = "Nugent change (post − pre)") +
+  theme_minimal()
+```
+
+**What the numbers say.** In every starting group the probiotic arm moved at
+least as much as placebo, and in the Lacto-low group it moved more (Nugent
+−4.2 vs −2.9; amine test 72% vs 59% converted to negative). In the
+Lacto-present group the extra benefit is thin or absent (−2.5 vs −3.3; 83% vs
+79%). That *pattern* is the shape you would expect if the probiotic mainly
+helped people with room to improve — but none of the interaction tests come
+close to significance (Nugent p = 0.13, pH p = 0.49), and the amine-test gaps
+(13 vs 4 percentage points) carry no test at all here. With 45 Lacto-present
+participants, differences of this size are exactly the kind that come and go
+by chance. **The honest answer: no, we cannot show that the probiotic only
+worked in one starting group.** The data lean that way but do not prove it.
+
+## 5. The gene-table check
+
+The clinical scores are coarse. The transcriptome is finer: if the probiotic
+truly worked through one starting state, genes should respond to the
+probiotic (a change from pre to post in the probiotic arm *beyond* placebo)
+more in that state. We run DESeq2 separately in each starting group — raw
+counts, sequencing batch in the design — and count genes whose
+arm × visit interaction is significant (FDR < 0.1). Note the sign: with
+"pre" as the reference level the interaction coefficient is flipped, so we
+count p-values, which do not care about sign.
+
+```{r deseq2, cache: true}
+genes <- d$genes
+responders <- function(sub) {
+  g <- genes[, sub$sample_id]
+  keep <- rowSums(g >= 10) >= 10
+  dds <- DESeqDataSetFromMatrix(g[keep, ], colData = as.data.frame(sub),
+            design = ~ rnaseq_batch + arm + time_point + arm:time_point)
+  dds <- DESeq(dds, quiet = TRUE)
+  res <- results(dds, name = "armprobiotic.time_pointpre")
+  c(tested = sum(keep), fdr = sum(res$padj < 0.1, na.rm = TRUE),
+    raw = sum(res$pvalue < 0.01, na.rm = TRUE))
+}
+by_start <- meta |>
+  mutate(start = if_else(lacto_share >= 0.10, "present", "low"))
+map_dfr(c(low = "low", present = "present"), ~
+  as.data.frame(by_start |> filter(start == .x)) |> responders(),
+  .id = "start") |>
+  mutate(across(where(is.numeric), as.integer))
+```
+
+Almost nothing responds in either group: 0 of 14,222 tested genes in the
+Lacto-low group and 2 of 14,224 in the Lacto-present group clear FDR 0.1.
+Even at a permissive raw p < 0.01 the counts are small (38 and 131). For
+scale, the visit itself (pre → post, both arms pooled) moved only 83 genes in
+the Lacto-present group and 0 in the Lacto-low group. So at the level of gene
+expression this intervention barely registered anywhere, in either starting
+state — there is no subgroup hiding here that the clinical scores missed.
+
+::: {.caution}
+Two cautions on the clinical analysis. First, the Lactobacillus change itself
+(pre → post share) is **not** tested here against the starting groups: those
+groups are defined by baseline Lactobacillus share, so a test of that same
+quantity would be circular. The Nugent, pH and amine outcomes come from the
+metadata, a different table. Second, both count tables are compositional —
+"a species's share went up" does not mean "there were more of it". The
+clinical outcomes and the transcriptome are the tables that escape that trap,
+which is another reason they are the tests that matter here.
+:::
+
+## 6. Conclusion
+
+**The probiotic did not work only in people whose community started a certain
+way — or at least, we cannot show that it did.** The point estimates lean
+towards a bigger benefit in participants who started Lactobacillus-low (Nugent
+−4.2 vs −2.9 against placebo), which would make biological sense: a
+Lactobacillus-dominant community has less dysbiosis to fix. But the
+interaction tests are not significant, the Lacto-present group has only 45
+participants, and the transcriptome shows essentially no probiotic response in
+either starting group. The right next step, if the question matters, is a
+formal three-way test (arm × visit × starting group) in DESeq2 with more
+power, or a larger cohort — not a stronger claim from these 176 people.
+
+## Choices made
+
+- **Starting-group definition:** Lactobacillus genus share ≥ 10% of reads at
+  the pre visit. Alternative not chosen: median split (50% and 50% of
+  participants but cuts through a dense part of the distribution, so tiny
+  differences in reads flip people between groups).
+- **Starting-group table:** microbiome species table. Alternative not chosen:
+  baseline Nugent ≥ 7 (a clinical definition; would have let us test the
+  microbiome, but "community state" is better measured by the community
+  itself).
+- **Outcomes tested:** Nugent, pH, amine test (metadata) and the gene table.
+  Alternative not chosen: change in Lactobacillus share, which is circular
+  against a group defined by baseline Lactobacillus.
+- **Interaction test:** ordinary linear model `change ~ arm * start`.
+  Alternatives not chosen: a rank-based test on amine conversion, and a
+  three-way DESeq2 model `~ arm * time_point * start` fitted once on all
+  samples (more powerful in principle, harder to read; a natural next step).
+- **Gene filter:** ≥ 10 counts in ≥ 10 samples, per starting group.
+  Alternative not chosen: the 02 report's ≥ 10 in ≥ 20 (the subgroups are
+  smaller, so the looser filter keeps more genes testable).
+- **Gene-model design:** `~ rnaseq_batch + arm + time_point + arm:time_point`,
+  fitted separately per starting group. Alternative not chosen: including
+  `discharge` and `clue_cells` as covariates (partly consequences of the
+  exposure, so they would soak up signal).
+- **Significance thresholds:** FDR < 0.1 for genes, p < 0.05 for the
+  interaction tests; raw p < 0.01 reported alongside gene counts as a
+  sensitivity check. Alternative not chosen: FDR < 0.05 (nothing changed —
+  the counts only fall).
+- **Samples dropped:** none. Nine participants with a missing post Nugent or
+  pH value fall out of those specific means (listwise, per outcome), but no
+  participant was excluded from the study.

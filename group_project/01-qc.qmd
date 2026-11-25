@@ -1,0 +1,393 @@
+---
+title: "Study A: data quality checks"
+format: html
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+This report checks the Study A data before formal analysis. Study A is the
+probiotic study, with samples collected before and after the intervention.
+The checks below look for problems that could make an analysis misleading:
+missing or duplicated samples, mismatched sample order, invalid counts,
+missing annotations, incomplete participant pairs, and unusually small
+libraries.
+
+## Load the data
+
+```{r setup}
+library(tidyverse)
+library(here)
+
+source(here("R/count_tables.R"))
+d <- read_counts("group_a")
+metadata <- d$metadata
+
+count_checks <- tibble(
+  table = c("microbiome", "RNA-seq"),
+  features = c(nrow(d$species), nrow(d$genes)),
+  samples = c(ncol(d$species), ncol(d$genes)),
+  total_counts = c(sum(d$species), sum(d$genes))
+)
+count_checks
+```
+
+Study A contains `r nrow(metadata)` samples from
+`r n_distinct(metadata$participant_id)` participants. There are
+`r nrow(d$species)` microbiome features and `r nrow(d$genes)` genes.
+
+## 1. Sample table checks
+
+Each sample should have one row, a unique sample ID, and the fields needed for
+the study design. The table below reports missing values and duplicate IDs.
+
+```{r metadata-checks}
+required_metadata <- c(
+  "sample_id", "participant_id", "time_point", "arm", "rnaseq_batch"
+)
+
+metadata_checks <- tibble(
+  check = c(
+    "Rows in metadata",
+    "Unique sample IDs",
+    "Missing values in required fields",
+    "Unexpected time points",
+    "Unexpected arms"
+  ),
+  result = c(
+    nrow(metadata),
+    n_distinct(metadata$sample_id),
+    sum(is.na(metadata[required_metadata])),
+    sum(!metadata$time_point %in% c("pre", "post")),
+    sum(!metadata$arm %in% c("placebo", "probiotic"))
+  )
+)
+metadata_checks
+```
+
+There should be zero missing values, zero unexpected values, and the first two
+rows should be equal. The study design is shown below so that the planned
+comparison is visible before any modelling.
+
+```{r design-table}
+metadata |>
+  count(arm, time_point) |>
+  arrange(arm, time_point)
+```
+
+## 2. Sample order and pairing
+
+The count-table columns must be in the same order as the metadata rows. A
+count table can have all the right sample names but still be wrong if the
+order differs. `read_counts()` is expected to enforce this ordering; the
+explicit checks below verify it.
+
+```{r order-check}
+order_checks <- tibble(
+  table = c("microbiome", "RNA-seq", "cytokines"),
+  same_sample_ids = c(
+    identical(colnames(d$species), metadata$sample_id),
+    identical(colnames(d$genes), metadata$sample_id),
+    identical(d$cytokines$sample_id, metadata$sample_id)
+  )
+)
+order_checks
+```
+
+The pre/post comparison is paired by participant. Every participant should
+have one sample at each time point.
+
+```{r pairing-check}
+pairing <- metadata |>
+  count(participant_id, time_point) |>
+  pivot_wider(names_from = time_point, values_from = n, values_fill = 0)
+
+pairing |>
+  summarise(
+    participants = n(),
+    complete_pairs = sum(pre == 1 & post == 1),
+    incomplete_pairs = sum(!(pre == 1 & post == 1))
+  )
+```
+
+```{r incomplete-pairs}
+pairing |>
+  filter(pre != 1 | post != 1)
+```
+
+## 3. Count-table integrity
+
+Raw count tables should contain finite, non-negative whole numbers. These are
+the values used by count-based methods such as DESeq2; they should not be
+replaced with percentages or log-transformed values before testing.
+
+```{r count-integrity}
+check_count_matrix <- function(x) {
+  c(
+    missing_or_infinite = sum(!is.finite(x)),
+    negative = sum(x < 0),
+    non_integer = sum(x != round(x)),
+    zero_samples = sum(colSums(x) == 0),
+    zero_features = sum(rowSums(x) == 0)
+  )
+}
+
+count_integrity <- bind_rows(
+  microbiome = check_count_matrix(d$species),
+  rnaseq = check_count_matrix(d$genes),
+  .id = "table"
+) |>
+  as_tibble()
+count_integrity
+```
+
+All reported error counts should be zero. Features with zero counts in every
+sample carry no information and can be filtered out during the analysis.
+
+## 4. Annotation and cytokine checks
+
+Feature annotations let us interpret results. We check that every counted
+microbial feature and gene has a matching annotation, and that cytokine rows
+cover the same samples.
+
+```{r annotation-checks}
+annotation_checks <- tibble(
+  annotation = c("microbiome taxonomy", "gene annotation"),
+  count_features = c(nrow(d$species), nrow(d$genes)),
+  annotated_features = c(
+    sum(rownames(d$species) %in% d$taxonomy$taxon),
+    sum(rownames(d$genes) %in% d$gene_info$ensembl_gene_id)
+  )
+) |>
+  mutate(
+    missing_features = count_features - annotated_features,
+    percent_annotated = 100 * annotated_features / count_features
+  )
+annotation_checks
+```
+
+```{r cytokine-checks}
+cytokine_checks <- tibble(
+  samples = nrow(d$cytokines),
+  duplicate_sample_ids = sum(duplicated(d$cytokines$sample_id)),
+  missing_sample_ids = sum(!metadata$sample_id %in% d$cytokines$sample_id),
+  missing_values = sum(is.na(d$cytokines))
+)
+cytokine_checks
+```
+
+## 5. Library sizes and possible outliers
+
+Library size is the total number of reads or counts in one sample. A much
+smaller library can make a sample less informative. This is a screening check,
+not an automatic reason to remove a sample: the final decision should also
+consider the study design and the downstream method.
+
+```{r library-size-table}
+library_sizes <- bind_rows(
+  tibble(table = "microbiome", sample_id = names(colSums(d$species)),
+         library_size = colSums(d$species)),
+  tibble(table = "RNA-seq", sample_id = names(colSums(d$genes)),
+         library_size = colSums(d$genes))
+) |>
+  left_join(select(metadata, sample_id, participant_id, time_point, arm),
+            by = "sample_id") |>
+  group_by(table) |>
+  mutate(
+    lower_screen = quantile(library_size, 0.25) -
+      1.5 * IQR(library_size),
+    low_library_screen = library_size < lower_screen
+  ) |>
+  ungroup()
+
+library_sizes |>
+  group_by(table) |>
+  summarise(
+    samples = n(),
+    minimum = min(library_size),
+    median = median(library_size),
+    maximum = max(library_size),
+    low_library_screen = sum(low_library_screen)
+  )
+```
+
+```{r library-size-plot}
+ggplot(library_sizes, aes(x = time_point, y = library_size, colour = arm)) +
+  geom_jitter(width = 0.12, alpha = 0.55) +
+  scale_y_log10() +
+  facet_wrap(~ table, scales = "free_y") +
+  labs(
+    title = "Sample library sizes",
+    x = NULL,
+    y = "Total counts (log10 scale)",
+    colour = "Arm"
+  ) +
+  theme_minimal()
+```
+
+## 6. Clinical field checks
+
+The metadata checks in Section 1 covered the five design fields only. The
+six clinical columns also need checking, because a missing or impossible
+value can silently drop samples from a plot or a model.
+
+```{r clinical-missing}
+clinical <- c("age", "ph", "nugent", "amine_test", "clue_cells", "discharge")
+
+clinical_missing <- tibble(
+  column = clinical,
+  n_missing = sapply(metadata[clinical], \(x) sum(is.na(x)))
+)
+clinical_missing
+```
+
+```{r clinical-ranges}
+clinical_ranges <- tibble(
+  column = c("ph", "nugent", "clue_cells", "age"),
+  minimum = sapply(metadata[c("ph", "nugent", "clue_cells", "age")], min, na.rm = TRUE),
+  maximum = sapply(metadata[c("ph", "nugent", "clue_cells", "age")], max, na.rm = TRUE),
+  plausible = c("3.5-7", "0-10", "0-99", "adult")
+)
+clinical_levels <- bind_rows(
+  metadata |> count(amine_test, name = "amine_test_n") |> rename(value = amine_test),
+  metadata |> count(discharge, name = "discharge_n") |> rename(value = discharge)
+)
+clinical_ranges
+clinical_levels
+```
+
+```{r clinical-affected}
+metadata |>
+  filter(if_any(all_of(clinical), is.na)) |>
+  select(sample_id, time_point, arm, ph, nugent, clue_cells)
+```
+
+All values fall inside plausible ranges and the categorical fields contain
+only the expected levels. Six values are missing, all in three samples:
+`A039_pre` (pH and clue cells), and `A128_post` and `A135_post` (Nugent
+score). These samples stay in the analysis; the missing values simply need
+handling (for example `na.rm = TRUE` in summaries).
+
+## 7. Batch balance and baseline differences
+
+Two study-design questions the earlier sections set up but did not test.
+First, is sequencing batch mixed up with treatment arm?
+
+```{r batch-balance}
+batch_balance <- table(metadata$arm, metadata$rnaseq_batch)
+batch_balance
+chisq.test(batch_balance)
+```
+
+Both arms appear in both batches, so batch is not confounded with treatment,
+but the proportions differ significantly (placebo leans towards B1, probiotic
+towards B2). `rnaseq_batch` should therefore go into the DESeq2 design.
+Because the comparison is paired by participant, it also matters whether a
+participant's two samples were sequenced in the same batch:
+
+```{r batch-consistency}
+metadata |>
+  distinct(participant_id, rnaseq_batch) |>
+  count(participant_id) |>
+  count(n, name = "participants")
+```
+
+All 176 participants have both samples in one batch, so batch differences
+cannot inflate the within-participant pre/post change.
+
+Second, were the arms already different at baseline? Each clinical measure is
+compared between arms using pre-visit samples only:
+
+```{r baseline-tests}
+pre <- metadata |> filter(time_point == "pre")
+
+baseline_tests <- tibble(
+  measure = c("ph", "nugent", "clue_cells", "age"),
+  placebo_mean = sapply(pre[c("ph", "nugent", "clue_cells", "age")],
+                        \(x) mean(x[pre$arm == "placebo"], na.rm = TRUE)),
+  probiotic_mean = sapply(pre[c("ph", "nugent", "clue_cells", "age")],
+                          \(x) mean(x[pre$arm == "probiotic"], na.rm = TRUE)),
+  p_value = sapply(pre[c("ph", "nugent", "clue_cells", "age")],
+                   \(x) wilcox.test(x ~ pre$arm, na.action = na.omit)$p.value)
+)
+baseline_tests
+```
+
+No measure differs between the arms (all p > 0.15), so the arms were balanced
+at baseline and post differences can be attributed to the intervention rather
+than a head start.
+
+## 8. Duplicate IDs and cytokine values
+
+The final checks cover things Sections 1-4 assumed: unique feature IDs, no
+unannounced samples in the count tables, and cytokine values that are usable
+numbers.
+
+```{r extended-integrity}
+extended_checks <- tibble(
+  check = c(
+    "Duplicate species IDs",
+    "Duplicate gene IDs",
+    "Duplicate taxonomy IDs",
+    "Duplicate gene annotation IDs",
+    "Count columns missing from metadata",
+    "Cytokine negative or non-finite values"
+  ),
+  result = c(
+    sum(duplicated(rownames(d$species))),
+    sum(duplicated(rownames(d$genes))),
+    sum(duplicated(d$taxonomy$taxon)),
+    sum(duplicated(d$gene_info$ensembl_gene_id)),
+    sum(!colnames(d$species) %in% metadata$sample_id) +
+      sum(!colnames(d$genes) %in% metadata$sample_id),
+    sum(is.na(d$cytokines[-1]) | !is.finite(as.matrix(d$cytokines[-1])))
+  )
+)
+extended_checks
+```
+
+```{r cytokine-na-samples}
+d$cytokines |>
+  select(sample_id, everything()) |>
+  filter(if_any(-sample_id, is.na)) |>
+  mutate(n_missing = rowSums(is.na(pick(-sample_id)))) |>
+  select(sample_id, n_missing)
+```
+
+All IDs are unique and the count tables contain no samples outside the
+metadata. The only blemish is `A069_post`, whose entire cytokine panel
+(18 values) is missing: keep it for the count-table analyses, but exclude it
+from cytokine analyses rather than imputing.
+
+## Conclusion
+
+The report should be considered ready for analysis only after checking that:
+
+1. sample IDs and sample order are correct;
+2. pre/post pairs are complete for the intended comparison;
+3. count integrity checks are zero;
+4. annotations cover the features to be analysed;
+5. any low-library samples are reviewed rather than removed automatically;
+6. clinical columns are complete enough and within plausible ranges;
+7. batch is included in the model design because arm and batch proportions
+   differ; and
+8. baseline balance between arms has been confirmed, so post differences can
+   be interpreted as change from a level playing field.
+
+For this dataset, the library-size screen is a flag for review, not a
+pre-specified exclusion rule. Count-based differential analysis should use the
+raw count matrices, while plots of library size may use a log scale only to
+make the spread easier to see.
+
+## Choices made
+
+- Dataset: Study A (`group_a_probiotic`); alternative: the instructional or Study B dataset.
+- Pairing: participant-level pre/post pairs; alternative: treating all samples as independent.
+- Outlier screen: 1.5 IQR below the lower quartile of library size; alternative: removing samples using an arbitrary fixed cutoff.
+- Count check: raw non-negative integer counts; alternative: checking CPM or log-transformed counts as input data.
+- Annotation check: match every feature ID to the supplied taxonomy or gene annotation; alternative: analysing unlabelled feature IDs only.
+- Clinical check: missing values and plausible ranges only; alternative: distributional outlier tests such as z-scores.
+- Batch balance: chi-square test of arm vs batch; alternative: reporting proportions without a test.
+- Baseline test: Wilcoxon rank-sum on pre-visit samples, `na.omit` per measure; alternative: a t-test or a paired change-score test.
+- Cytokine missing values: flag `A069_post` and exclude from cytokine analyses; alternative: imputing with molecule medians.

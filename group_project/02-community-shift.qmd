@@ -1,0 +1,282 @@
+---
+title: "Study A: did the vaginal community shift from pre to post, and does the shift differ by arm?"
+format:
+  html:
+    theme: minty
+    css: report.css
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+    code-tools: true
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+The probiotic trial measured each participant's vaginal microbiome before and
+after the intervention. This report asks two questions:
+
+1. **Did the community composition change from pre to post?** Composition means
+   *which species are there and in what proportions*, not just the total amount.
+2. **Is that change different in the probiotic arm than in the placebo arm?**
+   If the community drifts over time anyway (recovery, season, lab process), the
+   change caused by the probiotic is only the *extra* change in the probiotic
+   arm.
+
+Both questions are about the whole community, not single species, so the tools
+are ordination (a 2-D map of community similarity) and PERMANOVA (a test on
+those similarities).
+
+## 2. Data
+
+We use the microbiome species table. Species that are nearly absent carry no
+information about community structure but do add noise, so we keep only species
+with at least 10 counts in at least 20 samples (64 of 220 species survive).
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(microViz)
+library(phyloseq)
+
+source(here("R/count_tables.R"))
+
+ps <- as_counts("group_a", table = "microbiome",
+                min_count = 10, min_samples = 20)
+meta <- sample_data(ps) |> as.data.frame() |>
+  as_tibble(rownames = "sample_id")
+ps
+```
+
+```{r design}
+meta |> count(arm, time_point) |> arrange(arm, time_point)
+```
+
+## 3. The community map
+
+Each point below is one sample. Distance between points is Bray-Curtis
+dissimilarity: the share of total counts the two samples do *not* have in
+common. Points close together have similar communities. Bray-Curtis is built on
+raw counts, which is what we have; it is computed from proportions internally,
+so library size does not drive it.
+
+```{r pcoa, fig.width=9, fig.height=4.2}
+ord <- ps |>
+  tax_transform("identity") |>   # Bray-Curtis wants raw counts, untouched
+  dist_calc("bray") |>
+  ord_calc("PCoA")
+
+ord_plot(ord, colour = "time_point", shape = "arm") +
+  scale_colour_manual(values = c(pre = "#c46a3f", post = "#2b7bb9")) +
+  labs(title = "All 352 samples", colour = "Visit", shape = "Arm") +
+  theme_minimal()
+```
+
+Because each participant appears twice, the more informative view draws each
+participant's arrow from pre to post. Long arrows are big individual changes;
+the question is whether the blue (probiotic) arrows are systematically longer
+or point somewhere different from the orange (placebo) ones.
+
+```{r arrows, fig.width=7.5, fig.height=6}
+coords <- vegan::scores(ord@ord, display = "sites", choices = 1:2) |>
+  as.data.frame() |>
+  rownames_to_column("sample_id") |>
+  left_join(meta, by = "sample_id") |>
+  select(sample_id, participant_id, arm, time_point, MDS1, MDS2)
+
+arrows <- coords |>
+  pivot_wider(names_from = time_point, values_from = MDS1:MDS2)
+
+ggplot(arrows, aes(x = MDS1_pre, y = MDS2_pre, xend = MDS1_post, yend = MDS2_post,
+                   colour = arm)) +
+  geom_segment(arrow = arrow(length = unit(0.14, "cm")), alpha = 0.5,
+               lineend = "round") +
+  geom_point(data = coords, aes(x = MDS1, y = MDS2, colour = arm),
+             alpha = 0.25, size = 0.9, show.legend = FALSE,
+             inherit.aes = FALSE) +
+  scale_colour_manual(values = c(placebo = "#c46a3f", probiotic = "#2b7bb9")) +
+  labs(title = "Each participant's community, pre \u2192 post",
+       x = "PCoA 1", y = "PCoA 2", colour = "Arm") +
+  coord_equal() +
+  theme_minimal()
+```
+
+Most arrows are short: individual communities are fairly stable over the study
+period. There is no obvious direction difference between the arms by eye —
+which is what the formal test below checks.
+
+## 4. PERMANOVA: does anything explain the distances?
+
+PERMANOVA asks: *do the between-sample distances depend on a label?* It works
+like an ANOVA, but instead of comparing means it compares how much of the
+variation in pairwise distances is explained by each label, and it gets its
+p-value by shuffling the labels ("permutations") rather than assuming any
+statistical distribution. It is the standard companion to ordination plots.
+Reference: Anderson (2001), *Austral Ecology* 26:32–46
+([doi:10.1046/j.1442-9993.2001.01070.x](https://doi.org/10.1046/j.1442-9993.2001.01070.x)),
+or `?vegan::adonis2`.
+
+Two details matter for our design:
+
+- **We block by participant** (`strata`). PERMANOVA otherwise treats all 352
+  samples as independent and shuffles labels freely, ignoring that two samples
+  belong to the same person. Blocking shuffles labels only *within* each
+  participant, so the pre/post comparison is respected.
+- **Batch is in the model** because the QC report found the arms were not split
+  evenly across sequencing batches. The interaction `time_point:arm` is the
+  term that answers question 2: it asks whether the pre→post change is
+  *different* between arms.
+
+```{r permanova}
+set.seed(42)
+permanova <- dist_permanova(
+  ord,
+  variables    = c("time_point", "arm", "rnaseq_batch"),
+  interactions = "time_point:arm",
+  n_perms      = 999,
+  strata       = sample_data(ps)$participant_id,
+  by           = "terms"
+)
+permanova@permanova
+```
+
+R² is the share of the variation in community distances explained by each term.
+The results:
+
+- **time_point explains 8.5% (p = 0.001)**: the community genuinely differs
+  between visits, regardless of arm.
+- **The interaction explains 0.6% (p = 0.022)**: statistically detectable, but
+  tiny — and small p-values with 999 permutations can overstate importance, so
+  we test this further below.
+- **arm explains 1.0% (p = 0.001)** on its own, but that main effect pools both
+  visits; the term that answers our question is the interaction, and the
+  baseline check below separates the two.
+
+## 5. Does the change differ by arm?
+
+### 5.1 The direct paired test
+
+PERMANOVA asks about distances between *all* samples. A more direct question:
+for each participant, how far apart are their own pre and post communities? If
+the probiotic changed communities more than placebo, probiotic participants
+should have larger self-distances. With one number per participant we can
+compare arms with an ordinary test.
+
+```{r paired-distances}
+# recompute the actual pre-post Bray-Curtis distance per participant from the
+# distance matrix itself (the map is only a 2-D approximation of it)
+md2 <- meta |> select(sample_id, participant_id, arm, time_point)
+pre_id  <- md2 |> filter(time_point == "pre")  |> arrange(participant_id) |> pull(sample_id)
+post_id <- md2 |> filter(time_point == "post") |> arrange(participant_id) |> pull(sample_id)
+stopifnot(substr(pre_id, 1, 4) == substr(post_id, 1, 4))  # pairs really match
+
+distmat <- as.matrix(ord@dist)
+paired <- tibble(
+  participant_id = md2$participant_id[match(pre_id, md2$sample_id)],
+  arm            = md2$arm[match(pre_id, md2$sample_id)],
+  pre_post_dist  = distmat[pre_id, post_id]
+)
+```
+
+```{r paired-summary}
+paired |>
+  group_by(arm) |>
+  summarise(participants = n(),
+            median_pre_post_dist = median(pre_post_dist),
+            mean_pre_post_dist = mean(pre_post_dist))
+```
+
+```{r paired-plot, fig.width=6.5, fig.height=4}
+ggplot(paired, aes(x = arm, y = pre_post_dist, colour = arm)) +
+  geom_boxplot(outlier.alpha = 0.4, show.legend = FALSE) +
+  scale_colour_manual(values = c(placebo = "#c46a3f", probiotic = "#2b7bb9")) +
+  labs(title = "Bray-Curtis distance between each participant's own pre and post sample",
+       x = NULL, y = "Pre\u2013post Bray-Curtis distance") +
+  theme_minimal()
+```
+
+```{r paired-test}
+wilcox.test(pre_post_dist ~ arm, data = paired)
+```
+
+The medians are nearly identical (0.854 vs 0.877) and the test gives
+p = 0.183: **no evidence that the pre→post change is bigger in the probiotic
+arm** when measured this way.
+
+### 5.2 Were the arms different before the intervention?
+
+If the arms started apart, a main effect of `arm` could be mistaken for a
+treatment effect. Testing pre-visit samples only:
+
+```{r baseline}
+ps_pre <- prune_samples(meta$sample_id[meta$time_point == "pre"], ps)
+set.seed(42)
+dist_permanova(
+  ps_pre |> tax_transform("identity") |> dist_calc("bray") |> ord_calc("PCoA"),
+  variables = c("arm", "rnaseq_batch"),
+  n_perms   = 999
+)@permanova
+```
+
+p = 0.658 for `arm`: the arms had statistically indistinguishable communities
+at baseline, so any post-intervention difference is not a head start.
+
+## 6. A compositional cross-check
+
+Counts like these are **compositional**: sequencing gives proportions of a
+fixed budget, so "species A went down" can just mean "species B went up".
+Bray-Curtis is computed on those proportions, which makes its interpretation
+caveat-prone. The standard alternative is Aitchison distance: CLR-transform the
+counts (log-ratio against the geometric mean of each sample) and then use
+Euclidean distance. If the answer is the same under both, we can trust it more.
+
+```{r aitchison}
+set.seed(42)
+ord_at <- ps |>
+  tax_transform("clr", rank = "species") |>  # microViz handles zeros before CLR
+  dist_calc("euclidean") |>
+  ord_calc("PCoA")
+
+dist_permanova(
+  ord_at,
+  variables    = c("time_point", "arm", "rnaseq_batch"),
+  interactions = "time_point:arm",
+  n_perms      = 999,
+  strata       = sample_data(ps)$participant_id,
+  by           = "terms"
+)@permanova
+```
+
+Same story for `time_point` (5.4%, p = 0.001), but the interaction is **not**
+significant under Aitchison (p = 0.112) — the tiny Bray-Curtis interaction does
+not survive a change of distance metric.
+
+## 7. Answer
+
+1. **Yes, the community changed from pre to post** — consistently across two
+   distance metrics and about 8% of the variation in community structure.
+   This is a study-wide drift or response, seen in both arms.
+2. **The change does not clearly differ between the probiotic and placebo
+   arms.** One analysis (Bray-Curtis interaction, p = 0.022) hints at a
+   difference, but it explains only 0.6% of the variation, and neither the
+   paired participant-level test (p = 0.183) nor the Aitchison cross-check
+   (p = 0.112) supports it. We would not call this a treatment effect on
+   community composition.
+
+A reasonable next question is whether *specific species* changed differently
+between arms — a whole-community null does not preclude a few taxa responding.
+That is the job of the differential-abundance module.
+
+## Choices made
+
+- Species filter: at least 10 counts in at least 20 samples (64 species kept); alternative: no filter (all 220 species, more noise from rare taxa) or a stricter filter.
+- Distance: Bray-Curtis on raw counts; alternative: Jaccard on presence/absence, or Aitchison (used as the cross-check in section 6).
+- Ordination: PCoA; alternative: NMDS, which reshuffles points to reduce stress but makes paired arrows harder to draw.
+- PERMANOVA strata: permutations blocked within participant; alternative: ignoring pairing, which inflates significance for time_point.
+- PERMANOVA term order: `by = "terms"` (sequential); alternative: `by = "margin"`, which reports each term adjusted for the others.
+- Batch: included as a covariate because arm and batch proportions differ (QC report, section 7); alternative: omitting it and risking batch effects reading as treatment effects.
+- Change measured as the pre-to-post Bray-Curtis distance per participant; alternative: a Euclidean distance between CLR profiles.
+- Paired test: Wilcoxon rank-sum on participant distances; alternative: a t-test (distances are right-skewed) or a paired-difference design, which cannot be used here because there is one distance per participant.
+- Baseline check: PERMANOVA on pre samples only; alternative: comparing baseline summary indices such as Shannon diversity.
